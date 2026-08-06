@@ -32,14 +32,18 @@ app = FastAPI(
 )
 
 # ----------------------------------------------------------------------
-# CORS - locked to your frontend origin(s) only.
+# CORS - locked to your frontend origin(s) only when ALLOWED_ORIGINS is set.
+# When ALLOWED_ORIGINS is empty we fall back to wildcard "*" so the app
+# still works in local / preview environments (credentials disabled then).
 # Set ALLOWED_ORIGINS in .env, e.g.:
 #   ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
 # ----------------------------------------------------------------------
+_cors_origins = settings.ALLOWED_ORIGINS or ["*"]
+_cors_credentials = bool(settings.ALLOWED_ORIGINS)  # disable creds with wildcard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS or [],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
