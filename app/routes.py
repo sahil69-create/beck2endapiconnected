@@ -78,9 +78,28 @@ def _fetch_holdings_enriched() -> List[Holding]:
         avg_price = safe_float(h.get("average_price"))
         invested_value = round(quantity * avg_price, 2)
 
+        # Prefer live LTP map, then any price fields in the raw holding record,
+        # finally fall back to average_price. Using 0 as LTP gives a wildly
+        # wrong negative P&L - that's worse than showing current ≈ invested.
         ltp = ltp_map.get(f"NSE_{symbol}")
-        current_value = round(quantity * ltp, 2) if ltp is not None else None
-        pnl = round(current_value - invested_value, 2) if current_value is not None else None
+        if ltp is None:
+            for key in (
+                "last_traded_price",
+                "ltp",
+                "current_price",
+                "price",
+                "current_value",
+            ):
+                if h.get(key) not in (None, ""):
+                    candidate = safe_float(h.get(key))
+                    if candidate and candidate > 0:
+                        ltp = candidate
+                        break
+        if ltp is None or ltp <= 0:
+            ltp = avg_price if avg_price > 0 else None
+
+        current_value = round(quantity * ltp, 2) if ltp is not None else invested_value
+        pnl = round(current_value - invested_value, 2)
 
         holdings.append(
             Holding(
@@ -91,10 +110,8 @@ def _fetch_holdings_enriched() -> List[Holding]:
                 invested_value=invested_value,
                 current_value=current_value,
                 pnl=pnl,
-                pnl_percent=pnl_percent(invested_value, current_value)
-                if current_value is not None
-                else None,
-                exchange="NSE",
+                pnl_percent=pnl_percent(invested_value, current_value),
+                exchange=h.get("exchange") or "NSE",
             )
         )
     return holdings
@@ -114,17 +131,42 @@ def positions() -> PositionsResponse:
     client = get_groww_client()
     raw_positions = client.get_positions()
 
-    items = [
-        Position(
-            symbol=p["trading_symbol"],
-            quantity=safe_float(p.get("quantity")),
-            average_price=safe_float(p.get("net_price")),
-            pnl=safe_float(p.get("realised_pnl")),
-            product=p.get("product"),
-            exchange=p.get("exchange"),
+    if raw_positions:
+        exchange_symbols = [f"NSE_{p['trading_symbol']}" for p in raw_positions]
+        ltp_map: dict = {}
+        try:
+            ltp_map = client.get_ltp(exchange_symbols)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            logger.warning("Failed to fetch LTPs for positions: %s", exc)
+
+    items = []
+    for p in raw_positions:
+        symbol = p["trading_symbol"]
+        ltp = ltp_map.get(f"NSE_{symbol}")
+        if ltp is None:
+            for key in (
+                "last_traded_price",
+                "ltp",
+                "current_price",
+                "price",
+            ):
+                if p.get(key) not in (None, ""):
+                    ltp = safe_float(p.get(key))
+                    if ltp and ltp > 0:
+                        break
+        if not ltp:
+            ltp = safe_float(p.get("net_price")) or None
+        items.append(
+            Position(
+                symbol=symbol,
+                quantity=safe_float(p.get("quantity")),
+                average_price=safe_float(p.get("net_price")),
+                last_traded_price=ltp,
+                pnl=safe_float(p.get("realised_pnl")),
+                product=p.get("product"),
+                exchange=p.get("exchange"),
+            )
         )
-        for p in raw_positions
-    ]
     return PositionsResponse(positions=items, count=len(items))
 
 
@@ -172,13 +214,36 @@ def watchlist() -> WatchlistResponse:
     exchange_symbols = [f"NSE_{s}" for s in symbols]
     ltp_map = client.get_ltp(exchange_symbols)
 
-    items = [
-        WatchlistItem(
-            symbol=symbol,
-            last_traded_price=ltp_map.get(f"NSE_{symbol}"),
+    items = []
+    for symbol in symbols:
+        ltp = ltp_map.get(f"NSE_{symbol}")
+        change_percent = None
+        # If the ltp map supports tuple (price, change_pct), unpack it.
+        # Otherwise try a per-symbol quote call to get change_percent.
+        if isinstance(ltp, (list, tuple)) and len(ltp) >= 2:
+            change_percent = safe_float(ltp[1])
+            ltp = safe_float(ltp[0])
+        if ltp is None or change_percent is None:
+            try:
+                q = client.get_quote(trading_symbol=symbol, exchange="NSE")
+                if ltp is None:
+                    ltp = safe_float(q.get("last_price"))
+                if change_percent is None:
+                    change_percent = safe_float(q.get("day_change_perc"))
+                    if change_percent is None and q.get("day_change") and ltp:
+                        day_change = safe_float(q.get("day_change"))
+                        prev_close = ltp - day_change
+                        if prev_close:
+                            change_percent = round((day_change / prev_close) * 100, 2)
+            except Exception as exc:  # noqa: BLE001 - tolerate missing change
+                logger.warning("watchlist quote failed for %s: %s", symbol, exc)
+        items.append(
+            WatchlistItem(
+                symbol=symbol,
+                last_traded_price=ltp,
+                change_percent=change_percent,
+            )
         )
-        for symbol in symbols
-    ]
     return WatchlistResponse(watchlist=items, count=len(items))
 
 
@@ -213,8 +278,8 @@ def portfolio() -> PortfolioResponse:
     client = get_groww_client()
     positions_raw = client.get_positions()
 
-    invested = sum(h.invested_value for h in holdings_items)
-    current = sum(h.current_value for h in holdings_items if h.current_value is not None)
+    invested = sum(float(h.invested_value or 0.0) for h in holdings_items)
+    current = sum(float(h.current_value or h.invested_value or 0.0) for h in holdings_items)
     total_pnl = round(current - invested, 2)
 
     return PortfolioResponse(
@@ -234,8 +299,8 @@ def portfolio() -> PortfolioResponse:
 def dashboard() -> DashboardResponse:
     holdings_items = _fetch_holdings_enriched()
 
-    invested = sum(h.invested_value for h in holdings_items)
-    current = sum(h.current_value for h in holdings_items if h.current_value is not None)
+    invested = sum(float(h.invested_value or 0.0) for h in holdings_items)
+    current = sum(float(h.current_value or h.invested_value or 0.0) for h in holdings_items)
     total_pnl = round(current - invested, 2)
 
     # "Today's" P&L requires each holding's previous close, which Groww's
