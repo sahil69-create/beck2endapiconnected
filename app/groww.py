@@ -258,10 +258,20 @@ class GrowwClient:
     def get_ltp(
         self, exchange_symbols: List[str], segment: str = "CASH"
     ) -> Dict[str, float]:
-        """exchange_symbols look like 'NSE_RELIANCE', 'BSE_SENSEX'. Max 50 per call."""
+        """exchange_symbols look like 'NSE_RELIANCE', 'BSE_SENSEX'. Max 50 per call.
+
+        Normalizes multiple Groww response shapes into a flat {symbol: ltp} dict:
+          - {NSE_X: price, NSE_Y: price}                 (flat)
+          - {"data": [{symbol, ltp}, ...]}                (list-of-records)
+          - {"prices": {NSE_X: price, ...}}               (nested "prices")
+          - {"market_data": [{exchange_symbol, price}...]}
+          - Any list of {symbol, last_price|ltp|price} records
+        """
+        from .utils import safe_float
+
         if not exchange_symbols:
             return {}
-        payload = self._request(
+        raw = self._request(
             "GET",
             "/v1/live-data/ltp",
             params={
@@ -269,7 +279,43 @@ class GrowwClient:
                 "exchange_symbols": ",".join(exchange_symbols),
             },
         )
-        return payload
+        result: Dict[str, float] = {}
+        if isinstance(raw, dict):
+            for _key in ("prices", "market_data", "payload"):
+                if isinstance(raw.get(_key), dict):
+                    raw = raw[_key]
+                    break
+            if isinstance(raw, dict):
+                list_of_records = raw.get("data")
+            else:
+                list_of_records = None
+        else:
+            list_of_records = raw if isinstance(raw, list) else None
+
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, (int, float, str)):
+                    price = safe_float(v, None)
+                    if price is not None:
+                        result[str(k)] = price
+
+        if list_of_records and isinstance(list_of_records, list):
+            for rec in list_of_records:
+                if not isinstance(rec, dict):
+                    continue
+                sym = (
+                    rec.get("exchange_symbol")
+                    or rec.get("symbol")
+                    or rec.get("trading_symbol")
+                )
+                price = None
+                for pk in ("ltp", "last_price", "last_traded_price", "price", "value"):
+                    price = safe_float(rec.get(pk), None)
+                    if price is not None:
+                        break
+                if sym and price is not None:
+                    result[str(sym)] = price
+        return result
 
     def get_quote(
         self, trading_symbol: str, exchange: str = "NSE", segment: str = "CASH"
