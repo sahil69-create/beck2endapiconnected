@@ -472,7 +472,7 @@ def _resolve_prev_close(holding: Holding, raw_holding: Any, client) -> Optional[
 @router.get("/dashboard", response_model=DashboardResponse, tags=["Dashboard"])
 def dashboard() -> DashboardResponse:
     client = get_groww_client()
-    raw_holdings = client.get_holdings() if True else []
+    raw_holdings = client.get_holdings()
     holdings_items = _fetch_holdings_enriched()
 
     # Build a raw-holding lookup keyed by (exchange, symbol) for prev_close resolution.
