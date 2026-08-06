@@ -56,54 +56,139 @@ def health() -> HealthResponse:
 # ----------------------------------------------------------------------
 # Holdings
 # ----------------------------------------------------------------------
+def _norm_exchange(exchange_raw: Any) -> str:
+    """Normalize an exchange label like 'NSE', 'NSE_EQ', 'BSE_EQ', 'BSE', '' -> 'NSE'|'BSE'."""
+    raw = str(exchange_raw or "").strip().upper()
+    if "BSE" in raw:
+        return "BSE"
+    if raw and raw != "NAN":
+        return "NSE"  # treat anything non-empty (incl. "NSE") as NSE
+    return "NSE"
+
+
+def _lookup_ltp(ltp_map: Dict[str, float], symbol: str, exchange: str) -> Optional[float]:
+    """Try multiple key formats to find an LTP in the map."""
+    if not symbol or not ltp_map:
+        return None
+    candidates = [
+        f"{exchange}_{symbol}",
+        f"{exchange}_{symbol.upper()}",
+        f"NSE_{symbol}",
+        f"BSE_{symbol}",
+        symbol,
+        symbol.upper(),
+    ]
+    for key in candidates:
+        price = ltp_map.get(key)
+        if price is not None and price > 0:
+            return float(price)
+    return None
+
+
 def _fetch_holdings_enriched() -> List[Holding]:
-    """Fetch holdings from Groww and enrich each with live price + P&L."""
+    """Fetch holdings from Groww and enrich each with live price + P&L.
+
+    For each holding we:
+      1. Read exchange + trading_symbol + quantity + average_price from raw record.
+      2. First try to pull LTP / current_price / last_traded_price directly from
+         the raw holding record (Groww's /holdings/user often embeds live data).
+      3. Fall back to a bulk /live-data/ltp call using the correct exchange.
+      4. Only then fall back to avg_price so current ≈ invested (better than 0).
+    """
     client = get_groww_client()
     raw_holdings = client.get_holdings()
 
     if not raw_holdings:
         return []
 
-    exchange_symbols = [f"NSE_{h['trading_symbol']}" for h in raw_holdings]
-    ltp_map = {}
-    try:
-        ltp_map = client.get_ltp(exchange_symbols)
-    except Exception as exc:  # noqa: BLE001 - degrade gracefully, holdings still useful without LTP
-        logger.warning("Failed to fetch LTPs for holdings: %s", exc)
+    # --- Pass 1: Read raw holding fields, collect those still needing LTP ---
+    per_symbol_exchange: List[tuple] = []
+    prefilled: Dict[str, float] = {}
+    for h in raw_holdings:
+        symbol = str(h.get("trading_symbol") or h.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        exchange = _norm_exchange(h.get("exchange"))
+        in_record_price: Optional[float] = None
+        for key in (
+            "last_traded_price",
+            "ltp",
+            "current_price",
+            "market_price",
+            "price",
+        ):
+            if h.get(key) not in (None, ""):
+                cand = safe_float(h.get(key), None)
+                if cand and cand > 0:
+                    in_record_price = cand
+                    break
+        # Sometimes "current_value" is set but per-unit price isn't — derive it.
+        if in_record_price is None:
+            qty = safe_float(h.get("quantity"))
+            cv = safe_float(h.get("current_value"), None)
+            if qty and cv and cv > 0:
+                in_record_price = round(cv / qty, 4)
+        if in_record_price:
+            prefilled[f"{exchange}_{symbol}"] = in_record_price
+        else:
+            per_symbol_exchange.append((symbol, exchange))
 
+    # --- Pass 2: Bulk LTP call for symbols that didn't have an inline price ---
+    ltp_map: Dict[str, float] = dict(prefilled)
+    if per_symbol_exchange:
+        exchange_symbols = [f"{ex}_{sym}" for sym, ex in per_symbol_exchange]
+        try:
+            batch = client.get_ltp(exchange_symbols)
+            if batch:
+                ltp_map.update(batch)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            logger.warning("Failed to fetch LTPs batch for %d holdings: %s",
+                           len(exchange_symbols), exc)
+
+    # --- Pass 3: Build enriched holdings ---
     holdings: List[Holding] = []
     for h in raw_holdings:
-        symbol = h["trading_symbol"]
+        symbol = str(h.get("trading_symbol") or h.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        exchange = _norm_exchange(h.get("exchange"))
         quantity = safe_float(h.get("quantity"))
         avg_price = safe_float(h.get("average_price"))
+        if avg_price <= 0 and quantity > 0:
+            iv = safe_float(h.get("invested_value"), None)
+            if iv and iv > 0:
+                avg_price = round(iv / quantity, 4)
         invested_value = round(quantity * avg_price, 2)
 
-        # Prefer live LTP map, then any price fields in the raw holding record,
-        # finally fall back to average_price. Using 0 as LTP gives a wildly
-        # wrong negative P&L - that's worse than showing current ≈ invested.
-        ltp = ltp_map.get(f"NSE_{symbol}")
-        if ltp is None:
-            for key in (
-                "last_traded_price",
-                "ltp",
-                "current_price",
-                "price",
-                "current_value",
-            ):
-                if h.get(key) not in (None, ""):
-                    candidate = safe_float(h.get(key))
-                    if candidate and candidate > 0:
-                        ltp = candidate
-                        break
+        ltp = _lookup_ltp(ltp_map, symbol, exchange)
         if ltp is None or ltp <= 0:
-            ltp = avg_price if avg_price > 0 else None
+            # Last resort: match current_value/quantity or fall back to avg_price.
+            qty = quantity if quantity else 1
+            cv = safe_float(h.get("current_value"), None)
+            if cv and cv > 0 and qty:
+                ltp = round(cv / qty, 4)
+            else:
+                ltp = avg_price if avg_price > 0 else None
 
         current_value = round(quantity * ltp, 2) if ltp is not None else invested_value
         pnl = round(current_value - invested_value, 2)
 
+        # Try to pull a human-readable company name from raw holding fields.
+        company_name = (
+            h.get("company_name")
+            or h.get("script_name")
+            or h.get("scrip_name")
+            or h.get("name")
+            or h.get("display_name")
+            or None
+        )
+        if company_name:
+            company_name = str(company_name).strip() or None
+
         holdings.append(
             Holding(
                 symbol=symbol,
+                company_name=company_name,
                 quantity=quantity,
                 average_price=avg_price,
                 last_traded_price=ltp,
@@ -111,7 +196,8 @@ def _fetch_holdings_enriched() -> List[Holding]:
                 current_value=current_value,
                 pnl=pnl,
                 pnl_percent=pnl_percent(invested_value, current_value),
-                exchange=h.get("exchange") or "NSE",
+                sector=(h.get("sector") or None),
+                exchange=exchange,
             )
         )
     return holdings
@@ -130,32 +216,50 @@ def holdings() -> HoldingsResponse:
 def positions() -> PositionsResponse:
     client = get_groww_client()
     raw_positions = client.get_positions()
+    ltp_map: Dict[str, float] = {}
 
     if raw_positions:
-        exchange_symbols = [f"NSE_{p['trading_symbol']}" for p in raw_positions]
-        ltp_map: dict = {}
-        try:
-            ltp_map = client.get_ltp(exchange_symbols)
-        except Exception as exc:  # noqa: BLE001 - degrade gracefully
-            logger.warning("Failed to fetch LTPs for positions: %s", exc)
+        per_symbol_exchange = []
+        for p in raw_positions:
+            sym = str(p.get("trading_symbol") or p.get("symbol") or "").strip()
+            if not sym:
+                continue
+            ex = _norm_exchange(p.get("exchange"))
+            in_record_price = None
+            for key in ("last_traded_price", "ltp", "current_price", "market_price", "price"):
+                cand = safe_float(p.get(key), None)
+                if cand and cand > 0:
+                    in_record_price = cand
+                    break
+            if in_record_price:
+                ltp_map[f"{ex}_{sym}"] = in_record_price
+            else:
+                per_symbol_exchange.append((sym, ex))
+        if per_symbol_exchange:
+            try:
+                batch = client.get_ltp([f"{ex}_{sym}" for sym, ex in per_symbol_exchange])
+                if batch:
+                    ltp_map.update(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to fetch LTPs for positions: %s", exc)
 
     items = []
     for p in raw_positions:
-        symbol = p["trading_symbol"]
-        ltp = ltp_map.get(f"NSE_{symbol}")
-        if ltp is None:
-            for key in (
-                "last_traded_price",
-                "ltp",
-                "current_price",
-                "price",
-            ):
-                if p.get(key) not in (None, ""):
-                    ltp = safe_float(p.get(key))
-                    if ltp and ltp > 0:
-                        break
-        if not ltp:
-            ltp = safe_float(p.get("net_price")) or None
+        symbol = str(p.get("trading_symbol") or p.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        ex = _norm_exchange(p.get("exchange"))
+        ltp = _lookup_ltp(ltp_map, symbol, ex)
+        if ltp is None or ltp <= 0:
+            for key in ("last_traded_price", "ltp", "current_price", "price"):
+                cand = safe_float(p.get(key), None)
+                if cand and cand > 0:
+                    ltp = cand
+                    break
+        if ltp is None or ltp <= 0:
+            ltp = safe_float(p.get("net_price"), None)
+            if not ltp:
+                ltp = None
         items.append(
             Position(
                 symbol=symbol,
@@ -164,7 +268,7 @@ def positions() -> PositionsResponse:
                 last_traded_price=ltp,
                 pnl=safe_float(p.get("realised_pnl")),
                 product=p.get("product"),
-                exchange=p.get("exchange"),
+                exchange=ex,
             )
         )
     return PositionsResponse(positions=items, count=len(items))
@@ -202,41 +306,57 @@ def orders() -> OrdersResponse:
 # configure yourself (WATCHLIST_SYMBOLS in .env, comma-separated NSE
 # trading symbols) and enriches it with live price data. If Groww adds a
 # native watchlist endpoint later, swap the symbol source here.
+#
+# Each symbol can be prefixed with "BSE:" to force the BSE exchange.
 # ----------------------------------------------------------------------
 @router.get("/watchlist", response_model=WatchlistResponse, tags=["Portfolio"])
 def watchlist() -> WatchlistResponse:
-    symbols = [s.strip() for s in os.getenv("WATCHLIST_SYMBOLS", "").split(",") if s.strip()]
+    raw_items = [s.strip() for s in os.getenv("WATCHLIST_SYMBOLS", "").split(",") if s.strip()]
 
-    if not symbols:
+    if not raw_items:
         return WatchlistResponse(watchlist=[], count=0)
 
     client = get_groww_client()
-    exchange_symbols = [f"NSE_{s}" for s in symbols]
-    ltp_map = client.get_ltp(exchange_symbols)
+
+    parsed = []
+    for item in raw_items:
+        item_upper = item.upper()
+        if item_upper.startswith("BSE:"):
+            parsed.append((item[4:].strip(), "BSE"))
+        elif item_upper.startswith("NSE:"):
+            parsed.append((item[4:].strip(), "NSE"))
+        else:
+            parsed.append((item, "NSE"))
+
+    exchange_symbols = [f"{ex}_{sym}" for sym, ex in parsed]
+    ltp_map: Dict[str, float] = {}
+    try:
+        ltp_map = client.get_ltp(exchange_symbols)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("watchlist LTP batch failed: %s", exc)
 
     items = []
-    for symbol in symbols:
-        ltp = ltp_map.get(f"NSE_{symbol}")
+    for symbol, ex in parsed:
+        ltp = _lookup_ltp(ltp_map, symbol, ex)
         change_percent = None
-        # If the ltp map supports tuple (price, change_pct), unpack it.
-        # Otherwise try a per-symbol quote call to get change_percent.
         if isinstance(ltp, (list, tuple)) and len(ltp) >= 2:
-            change_percent = safe_float(ltp[1])
-            ltp = safe_float(ltp[0])
+            change_percent = safe_float(ltp[1], None)
+            ltp = safe_float(ltp[0], None)
         if ltp is None or change_percent is None:
             try:
-                q = client.get_quote(trading_symbol=symbol, exchange="NSE")
+                q = client.get_quote(trading_symbol=symbol, exchange=ex)
                 if ltp is None:
-                    ltp = safe_float(q.get("last_price"))
+                    ltp = safe_float(q.get("last_price"), None)
                 if change_percent is None:
-                    change_percent = safe_float(q.get("day_change_perc"))
-                    if change_percent is None and q.get("day_change") and ltp:
-                        day_change = safe_float(q.get("day_change"))
-                        prev_close = ltp - day_change
-                        if prev_close:
-                            change_percent = round((day_change / prev_close) * 100, 2)
-            except Exception as exc:  # noqa: BLE001 - tolerate missing change
-                logger.warning("watchlist quote failed for %s: %s", symbol, exc)
+                    change_percent = safe_float(q.get("day_change_perc"), None)
+                    if change_percent is None:
+                        day_change = safe_float(q.get("day_change"), None)
+                        if day_change is not None and ltp:
+                            prev_close = ltp - day_change
+                            if prev_close:
+                                change_percent = round((day_change / prev_close) * 100, 2)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("watchlist quote failed for %s:%s: %s", ex, symbol, exc)
         items.append(
             WatchlistItem(
                 symbol=symbol,
