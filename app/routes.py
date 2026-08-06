@@ -415,53 +415,135 @@ def portfolio() -> PortfolioResponse:
 # ----------------------------------------------------------------------
 # Dashboard (aggregate view)
 # ----------------------------------------------------------------------
+def _resolve_prev_close(holding: Holding, raw_holding: Any, client) -> Optional[float]:
+    """Return yesterday's close for a single holding.
+
+    Tries, in order:
+      1. Fields already present on the raw holding record (yesterday_close,
+         previous_close, prev_close, yesterday_price, day_before_price).
+      2. A /v1/live-data/quote call that returns ohlc.close = previous close.
+    """
+    from .utils import safe_float as sf
+
+    if isinstance(raw_holding, dict):
+        for key in (
+            "yesterday_close",
+            "previous_close",
+            "prev_close",
+            "previous_day_close",
+            "yesterday_price",
+            "prev_price",
+            "close",
+            "day_close",
+        ):
+            cand = sf(raw_holding.get(key), None)
+            if cand and cand > 0:
+                return cand
+        # Sometimes day_change is present; derive prev_close = ltp - day_change
+        ltp_raw = holding.last_traded_price
+        if ltp_raw and ltp_raw > 0:
+            for dk in ("day_change", "change", "today_change", "change_amount"):
+                dc = sf(raw_holding.get(dk), None)
+                if dc is not None:
+                    cand = ltp_raw - dc
+                    if cand > 0:
+                        return cand
+    # Fallback: quote call (cheapest single-call source of prev_close)
+    try:
+        ex = holding.exchange or "NSE"
+        q = client.get_quote(trading_symbol=holding.symbol, exchange=ex)
+        ohlc = q.get("ohlc") if isinstance(q, dict) else None
+        if isinstance(ohlc, dict):
+            cand = sf(ohlc.get("close"), None)
+            if cand and cand > 0:
+                return cand
+        # Some schemas place previous_close at the root
+        if isinstance(q, dict):
+            for pk in ("previous_close", "prev_close", "yesterday_close", "last_day_close"):
+                cand = sf(q.get(pk), None)
+                if cand and cand > 0:
+                    return cand
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("prev_close quote failed for %s:%s: %s",
+                       holding.exchange, holding.symbol, exc)
+    return None
+
+
 @router.get("/dashboard", response_model=DashboardResponse, tags=["Dashboard"])
 def dashboard() -> DashboardResponse:
+    client = get_groww_client()
+    raw_holdings = client.get_holdings() if True else []
     holdings_items = _fetch_holdings_enriched()
+
+    # Build a raw-holding lookup keyed by (exchange, symbol) for prev_close resolution.
+    raw_by_key: Dict[tuple, Any] = {}
+    if isinstance(raw_holdings, list):
+        for rh in raw_holdings:
+            sym = str(rh.get("trading_symbol") or rh.get("symbol") or "").strip()
+            ex = _norm_exchange(rh.get("exchange"))
+            if sym:
+                raw_by_key[(ex, sym)] = rh
 
     invested = sum(float(h.invested_value or 0.0) for h in holdings_items)
     current = sum(float(h.current_value or h.invested_value or 0.0) for h in holdings_items)
     total_pnl = round(current - invested, 2)
 
-    # "Today's" P&L requires each holding's previous close, which Groww's
-    # /v1/holdings/user and /v1/live-data/ltp responses don't include (ltp
-    # only gives the current price). Getting a true day P&L would mean an
-    # extra /v1/live-data/ohlc or /quote call per symbol. Left at 0 here to
-    # avoid silently returning a wrong number - wire up get_ohlc() per
-    # holding if you want this populated.
+    # Today's P&L: sum over holdings of (ltp - prev_close) * qty
     todays_pnl = 0.0
+    yesterdays_value = 0.0
+    for h in holdings_items:
+        if h.last_traded_price is None or h.quantity is None:
+            continue
+        rh = raw_by_key.get(((h.exchange or "NSE"), h.symbol))
+        prev_close = _resolve_prev_close(h, rh, client)
+        if prev_close and prev_close > 0:
+            today_pnl_for_h = round((h.last_traded_price - prev_close) * h.quantity, 2)
+            todays_pnl += today_pnl_for_h
+            yesterdays_value += prev_close * h.quantity
+    todays_pnl = round(todays_pnl, 2)
+    todays_base = yesterdays_value if yesterdays_value > 0 else (current - todays_pnl)
 
     movers_source = [
         h for h in holdings_items if h.pnl_percent is not None
     ]
     sorted_by_pnl = sorted(movers_source, key=lambda h: h.pnl_percent, reverse=True)
     top_gainers = [
-        MoverItem(symbol=h.symbol, pnl_percent=h.pnl_percent, pnl=h.pnl)
+        MoverItem(
+            symbol=h.symbol,
+            company_name=h.company_name,
+            pnl_percent=h.pnl_percent,
+            pnl=h.pnl,
+        )
         for h in sorted_by_pnl[:5]
-        if h.pnl_percent > 0
+        if h.pnl_percent and h.pnl_percent > 0
     ]
     top_losers = [
-        MoverItem(symbol=h.symbol, pnl_percent=h.pnl_percent, pnl=h.pnl)
-        for h in sorted(movers_source, key=lambda h: h.pnl_percent)[:5]
-        if h.pnl_percent < 0
+        MoverItem(
+            symbol=h.symbol,
+            company_name=h.company_name,
+            pnl_percent=h.pnl_percent,
+            pnl=h.pnl,
+        )
+        for h in sorted(movers_source, key=lambda h: h.pnl_percent or 0)[:5]
+        if h.pnl_percent and h.pnl_percent < 0
     ]
 
     allocation_raw = [
-        {"label": h.symbol, "value": h.current_value or h.invested_value}
+        {
+            "label": h.company_name or h.symbol,
+            "value": float(h.current_value or h.invested_value or 0.0),
+        }
         for h in holdings_items
     ]
     allocation_slices = compute_allocation(allocation_raw, "value", "label")
     portfolio_allocation = [AllocationSlice(**a) for a in allocation_slices]
 
-    # Sector allocation requires sector metadata Groww's holdings/LTP APIs
-    # don't provide - left empty unless you enrich holdings with your own
-    # symbol->sector mapping.
     sector_allocation: List[AllocationSlice] = []
 
     return DashboardResponse(
         current_portfolio_value=round(current, 2),
-        todays_pnl=round(todays_pnl, 2),
-        todays_pnl_percent=pnl_percent(current - todays_pnl, current) if current else 0.0,
+        todays_pnl=todays_pnl,
+        todays_pnl_percent=pnl_percent(todays_base, todays_base + todays_pnl) if todays_base else 0.0,
         total_pnl=total_pnl,
         total_pnl_percent=pnl_percent(invested, current),
         invested_amount=round(invested, 2),
